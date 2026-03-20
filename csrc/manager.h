@@ -96,6 +96,7 @@ private:
 
     void install_protections();
     int run_warmup(nb::callable& kernel, const nb::tuple& args, cudaStream_t stream);
+    nb::callable get_kernel(const std::string& qualname);
 };
 
 #endif //PYGPUBENCH_SRC_MANAGER_H

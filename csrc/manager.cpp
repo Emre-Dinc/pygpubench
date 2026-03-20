@@ -13,8 +13,10 @@
 #include <cerrno>
 #include <limits>
 #include <random>
+#include <thread>
 #include <nvtx3/nvToolsExt.h>
 #include <nanobind/stl/string.h>
+#include <sys/mman.h>
 
 static constexpr std::size_t ArenaSize = 2 * 1024 * 1024;
 
@@ -23,6 +25,7 @@ extern void install_landlock();
 extern bool mseal_supported();
 extern void seal_executable_mappings();
 extern void install_seccomp_filter();
+extern void seccomp_protect_page_range(uintptr_t protected_page, size_t page_size);
 
 static void check_check_approx_match_dispatch(unsigned* result, void* expected_data, nb::dlpack::dtype expected_type,
                                        const nb_cuda_array& received, float r_tol, float a_tol, unsigned seed, std::size_t n_bytes, cudaStream_t stream) {
@@ -300,6 +303,38 @@ int BenchmarkManager::run_warmup(nb::callable& kernel, const nb::tuple& args, cu
     return actual_calls;
 }
 
+void protect_range(void* ptr, size_t size, int prot) {
+    std::uintptr_t start = reinterpret_cast<std::uintptr_t>(ptr) & ~4095;
+    std::uintptr_t end   = (reinterpret_cast<std::uintptr_t>(ptr) + size + 4095) & ~4095;
+    if (mprotect(reinterpret_cast<void*>(start), end - start, prot) < 0)
+        throw std::system_error(errno, std::system_category(), "mprotect");
+}
+
+nb::callable BenchmarkManager::get_kernel(const std::string& qualname) {
+    nb::gil_scoped_release release;
+    std::uintptr_t lo = reinterpret_cast<std::uintptr_t>(this) & ~4095;
+    std::uintptr_t hi = (reinterpret_cast<std::uintptr_t>(this) + sizeof(BenchmarkManager) + 4095) & ~4095;
+
+    nb::callable kernel;
+    // make the BenchmarkManager inaccessible
+    protect_range(reinterpret_cast<void*>(lo), hi - lo, PROT_NONE);
+    // TODO make stack inaccessible (may be impossible) or read-only during the call
+    // call the python kernel generation function from a different thread.
+
+    std::thread make_kernel_thread([&]() {
+        // new thread, new seccomp.
+        seccomp_protect_page_range(lo, hi - lo);
+        nb::gil_scoped_acquire guard;
+        kernel = kernel_from_qualname(qualname);
+    });
+
+    make_kernel_thread.join();
+    // make it accessible again. This is in the original thread, so the tightened seccomp
+    // policy does not apply here.
+    protect_range(reinterpret_cast<void*>(lo), hi - lo, PROT_READ | PROT_WRITE);
+    return kernel;
+}
+
 void BenchmarkManager::do_bench_py(
         const std::string& kernel_qualname,
         const std::vector<nb::tuple>& args,
@@ -311,7 +346,7 @@ void BenchmarkManager::do_bench_py(
 
     // at this point, we call user code as we import the kernel (executing arbitrary top-level code)
     // after this, we cannot trust python anymore
-    nb::callable kernel = kernel_from_qualname(kernel_qualname);
+    nb::callable kernel = get_kernel(kernel_qualname);
 
     // ok, first run for compilations etc
     nvtx_push("warmup");
