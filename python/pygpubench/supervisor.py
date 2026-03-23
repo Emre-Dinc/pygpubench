@@ -5,7 +5,7 @@ from typing import Optional
 from . import _pygpubench
 
 
-def _supervisor_entry(sock: socket.socket) -> None:
+def _supervisor_entry(sock: socket.socket):
     """
     Entry point for the supervisor process.
     Calls into C++ immediately and never returns to Python.
@@ -27,11 +27,11 @@ class SeccompSupervisor:
       - loops handling mprotect notifications until the inner thread exits
 
     The tracee side:
-      - calls seccomp_install_mprotect_notify(tracee_sock_fd, lo, hi)
+      - calls seccomp_install_memory_notify(tracee_sock_fd, lo, hi)
         from the inner thread, which installs the filter and sends the unotify fd
     """
 
-    def __init__(self) -> None:
+    def __init__(self):
         ctx = mp.get_context('spawn')
 
         # SOCK_SEQPACKET: message-boundary preserving, connection-oriented.
@@ -64,12 +64,7 @@ class SeccompSupervisor:
         Survives pickling across mp.spawn via mp.reduction."""
         return self._tracee_sock
 
-    def close(self) -> None:
-        """
-        Close the tracee-side socket and wait for the supervisor to exit.
-        Closing the socket causes the supervisor's unotify fd to become
-        invalid, which terminates its event loop.
-        """
+    def close(self):
         if self._tracee_sock:
             self._tracee_sock.close()
             self._tracee_sock = None
@@ -80,7 +75,7 @@ class SeccompSupervisor:
                 self._process.join()
             self._process = None
 
-    def __del__(self) -> None:
+    def __del__(self):
         self.close()
 
     def __enter__(self):

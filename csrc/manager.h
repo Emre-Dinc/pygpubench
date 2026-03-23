@@ -106,7 +106,7 @@ private:
     // able to do a real cheat. But we can test this much easier.
 #ifdef ENABLE_EXPLOIT_TARGET
     // Known canary value for exploit testing
-    volatile uint64_t g_exploit_target = 0xDEADBEEFCAFEBABE;
+    volatile uint64_t mExploitCanary = 0xDEADBEEFCAFEBABE;
 #endif
 };
 

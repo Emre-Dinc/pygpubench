@@ -17,6 +17,7 @@
 #include <nvtx3/nvToolsExt.h>
 #include <nanobind/stl/string.h>
 #include <sys/mman.h>
+#include <unistd.h>
 
 static constexpr std::size_t ArenaSize = 2 * 1024 * 1024;
 
@@ -304,17 +305,22 @@ int BenchmarkManager::run_warmup(nb::callable& kernel, const nb::tuple& args, cu
     return actual_calls;
 }
 
+static inline std::uintptr_t page_mask() {
+    std::uintptr_t page_size = getpagesize();
+    return ~(page_size - 1u);
+}
+
 void protect_range(void* ptr, size_t size, int prot) {
-    std::uintptr_t start = reinterpret_cast<std::uintptr_t>(ptr) & ~4095;
-    std::uintptr_t end   = (reinterpret_cast<std::uintptr_t>(ptr) + size + 4095) & ~4095;
+    std::uintptr_t start = reinterpret_cast<std::uintptr_t>(ptr) & page_mask();
+    std::uintptr_t end   = (reinterpret_cast<std::uintptr_t>(ptr) + size + getpagesize() - 1) & page_mask();
     if (mprotect(reinterpret_cast<void*>(start), end - start, prot) < 0)
         throw std::system_error(errno, std::system_category(), "mprotect");
 }
 
 nb::callable BenchmarkManager::get_kernel(const std::string& qualname) {
     nb::gil_scoped_release release;
-    const std::uintptr_t lo = reinterpret_cast<std::uintptr_t>(this) & ~4095;
-    const std::uintptr_t hi = (reinterpret_cast<std::uintptr_t>(this) + sizeof(BenchmarkManager) + 4095) & ~4095;
+    const std::uintptr_t lo = reinterpret_cast<std::uintptr_t>(this) & page_mask();
+    const std::uintptr_t hi = (reinterpret_cast<std::uintptr_t>(this) + sizeof(BenchmarkManager) + getpagesize() - 1) & page_mask();
 
     nb::callable kernel;
     std::exception_ptr thread_exception;
@@ -328,14 +334,20 @@ nb::callable BenchmarkManager::get_kernel(const std::string& qualname) {
     std::thread make_kernel_thread([&]() {
         try {
             if (sock >= 0) {
-                seccomp_install_memory_notify(sock, lo, hi);
+                try {
+                    seccomp_install_memory_notify(sock, lo, hi);
+                } catch (...) {
+                    close(sock);
+                    sock = -1;
+                    throw;
+                }
                 close(sock);
                 sock = -1;
             }
             nb::gil_scoped_acquire guard;
             kernel = kernel_from_qualname(qualname);
         } catch (...) {
-                thread_exception = std::current_exception();
+            thread_exception = std::current_exception();
         }
     });
 
@@ -454,7 +466,7 @@ void BenchmarkManager::do_bench_py(
     error_count -= mErrorCountShift;
 
     #ifdef ENABLE_EXPLOIT_TARGET
-    if (g_exploit_target != 0xDEADBEEFCAFEBABE) {
+    if (mExploitCanary != 0xDEADBEEFCAFEBABE) {
         fprintf(mOutputPipe, "error-count\t%u\n", 0);
         for (int i = 0; i < actual_calls; i++) {
             fprintf(mOutputPipe, "%d\t%f\n", test_order.at(i) - 1, 10.f);

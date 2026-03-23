@@ -14,6 +14,7 @@ from .supervisor import SeccompSupervisor
 
 if TYPE_CHECKING:
     import multiprocessing.connection
+    import socket
 
 
 __all__ = [
@@ -28,9 +29,10 @@ __all__ = [
 ]
 
 
-def _do_bench_impl(out_fd: "multiprocessing.connection.Connection", in_fd: "multiprocessing.connection.Connection", qualname: str, test_generator: TestGeneratorInterface,
+def _do_bench_impl(out_fd: "multiprocessing.connection.Connection", in_fd: "multiprocessing.connection.Connection", supervisor_sock: "socket.socket",
+                   qualname: str, test_generator: TestGeneratorInterface,
                    test_args: dict, stream: int = None, discard: bool = True,
-                   nvtx: bool = False, tb_conn: "multiprocessing.connection.Connection" = None, landlock=True, mseal=True, supervisor_sock: "multiprocessing.connection.Connection" = None):
+                   nvtx: bool = False, tb_conn: "multiprocessing.connection.Connection" = None, landlock=True, mseal=True):
     """
     Benchmarks the kernel referred to by `qualname` against the test case returned by `test_generator`.
     :param out_fd: Writable file descriptor to which benchmark results are written.
@@ -188,6 +190,7 @@ def do_bench_isolated(
             args=(
                 result_child,
                 sig_r,
+                supervisor.tracee_sock,
                 qualname,
                 test_generator,
                 test_args,
@@ -197,7 +200,6 @@ def do_bench_isolated(
                 child_tb_conn,
                 landlock,
                 mseal,
-                supervisor.tracee_sock,
             ),
         )
 
