@@ -10,9 +10,11 @@ from typing import Optional, TYPE_CHECKING
 from . import _pygpubench
 from ._types import *
 from .utils import DeterministicContext
+from .supervisor import SeccompSupervisor
 
 if TYPE_CHECKING:
     import multiprocessing.connection
+    import socket
 
 
 __all__ = [
@@ -27,7 +29,8 @@ __all__ = [
 ]
 
 
-def _do_bench_impl(out_fd: "multiprocessing.connection.Connection", in_fd: "multiprocessing.connection.Connection", qualname: str, test_generator: TestGeneratorInterface,
+def _do_bench_impl(out_fd: "multiprocessing.connection.Connection", in_fd: "multiprocessing.connection.Connection", supervisor_sock: "socket.socket",
+                   qualname: str, test_generator: TestGeneratorInterface,
                    test_args: dict, stream: int = None, discard: bool = True,
                    nvtx: bool = False, tb_conn: "multiprocessing.connection.Connection" = None, landlock=True, mseal=True):
     """
@@ -60,6 +63,7 @@ def _do_bench_impl(out_fd: "multiprocessing.connection.Connection", in_fd: "mult
                 nvtx,
                 landlock,
                 mseal,
+                supervisor_sock.fileno(),
             )
     except BaseException:
         if tb_conn is not None:
@@ -180,29 +184,31 @@ def do_bench_isolated(
 
     parent_tb_conn, child_tb_conn = ctx.Pipe(duplex=False)
 
-    process = ctx.Process(
-        target=_do_bench_impl,
-        args=(
-            result_child,
-            sig_r,
-            qualname,
-            test_generator,
-            test_args,
-            None,
-            discard,
-            nvtx,
-            child_tb_conn,
-            landlock,
-            mseal,
-        ),
-    )
+    with SeccompSupervisor() as supervisor:
+        process = ctx.Process(
+            target=_do_bench_impl,
+            args=(
+                result_child,
+                sig_r,
+                supervisor.tracee_sock,
+                qualname,
+                test_generator,
+                test_args,
+                None,
+                discard,
+                nvtx,
+                child_tb_conn,
+                landlock,
+                mseal,
+            ),
+        )
 
-    process.start()
-    child_tb_conn.close()
-    result_child.close()
-    sig_r.close()
+        process.start()
+        child_tb_conn.close()
+        result_child.close()
+        sig_r.close()
 
-    process.join(timeout=timeout)
+        process.join(timeout=timeout)
 
     if process.is_alive():
         process.kill()

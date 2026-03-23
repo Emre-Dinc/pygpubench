@@ -29,7 +29,7 @@ BenchmarkParameters read_benchmark_parameters(int input_fd, void* signature_out)
 
 class BenchmarkManager {
 public:
-    BenchmarkManager(int result_fd, ObfuscatedHexDigest signature, std::uint64_t seed, bool discard, bool nvtx, bool landlock, bool mseal);
+    BenchmarkManager(int result_fd, ObfuscatedHexDigest signature, std::uint64_t seed, bool discard, bool nvtx, bool landlock, bool mseal, int supervisor_socket);
     ~BenchmarkManager();
     std::pair<std::vector<nb::tuple>, std::vector<nb::tuple>> setup_benchmark(const nb::callable& generate_test_case, const nb::dict& kwargs, int repeats);
     void do_bench_py(const std::string& kernel_qualname, const std::vector<nb::tuple>& args, const std::vector<nb::tuple>& expected, cudaStream_t stream);
@@ -75,6 +75,7 @@ private:
     bool mDiscardCache = true;
     bool mLandlock = true;
     bool mSeal = true;
+    int mSupervisorSock = -1;
     std::uint64_t mSeed = -1;
     std::vector<Expected> mExpectedOutputs;
     std::vector<ShadowArgumentList> mShadowArguments;
@@ -96,6 +97,17 @@ private:
 
     void install_protections();
     int run_warmup(nb::callable& kernel, const nb::tuple& args, cudaStream_t stream);
+    nb::callable get_kernel(const std::string& qualname);
+
+
+    // debug only: Any sort of test exploit that targets specific values of this class is going to be brittle,
+    // because simple refactoring will break the exploit, even though it does not close the underlying vulnerability.
+    // so instead, we use this canary value: If an exploit is able to manipulate this value, it is probably also
+    // able to do a real cheat. But we can test this much easier.
+#ifdef ENABLE_EXPLOIT_TARGET
+    // Known canary value for exploit testing
+    volatile uint64_t mExploitCanary = 0xDEADBEEFCAFEBABE;
+#endif
 };
 
 #endif //PYGPUBENCH_SRC_MANAGER_H

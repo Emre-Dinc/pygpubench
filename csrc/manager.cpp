@@ -13,8 +13,11 @@
 #include <cerrno>
 #include <limits>
 #include <random>
+#include <thread>
 #include <nvtx3/nvToolsExt.h>
 #include <nanobind/stl/string.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 static constexpr std::size_t ArenaSize = 2 * 1024 * 1024;
 
@@ -23,6 +26,7 @@ extern void install_landlock();
 extern bool mseal_supported();
 extern void seal_executable_mappings();
 extern void install_seccomp_filter();
+extern void seccomp_install_memory_notify(int supervisor_sock, uintptr_t lo, uintptr_t hi);
 
 static void check_check_approx_match_dispatch(unsigned* result, void* expected_data, nb::dlpack::dtype expected_type,
                                        const nb_cuda_array& received, float r_tol, float a_tol, unsigned seed, std::size_t n_bytes, cudaStream_t stream) {
@@ -118,7 +122,8 @@ BenchmarkParameters read_benchmark_parameters(int input_fd, void* signature_out)
     return {seed, static_cast<int>(repeats)};
 }
 
-BenchmarkManager::BenchmarkManager(int result_fd, ObfuscatedHexDigest signature, std::uint64_t seed, bool discard, bool nvtx, bool landlock, bool mseal) : mSignature(std::move(signature)) {
+BenchmarkManager::BenchmarkManager(int result_fd, ObfuscatedHexDigest signature, std::uint64_t seed, bool discard,
+                                   bool nvtx, bool landlock, bool mseal, int supervisor_socket) : mSignature(std::move(signature)), mSupervisorSock(supervisor_socket) {
     int device;
     CUDA_CHECK(cudaGetDevice(&device));
     CUDA_CHECK(cudaDeviceGetAttribute(&mL2CacheSize, cudaDevAttrL2CacheSize, device));
@@ -300,6 +305,66 @@ int BenchmarkManager::run_warmup(nb::callable& kernel, const nb::tuple& args, cu
     return actual_calls;
 }
 
+static inline std::uintptr_t page_mask() {
+    std::uintptr_t page_size = getpagesize();
+    return ~(page_size - 1u);
+}
+
+void protect_range(void* ptr, size_t size, int prot) {
+    std::uintptr_t start = reinterpret_cast<std::uintptr_t>(ptr) & page_mask();
+    std::uintptr_t end   = (reinterpret_cast<std::uintptr_t>(ptr) + size + getpagesize() - 1) & page_mask();
+    if (mprotect(reinterpret_cast<void*>(start), end - start, prot) < 0)
+        throw std::system_error(errno, std::system_category(), "mprotect");
+}
+
+nb::callable BenchmarkManager::get_kernel(const std::string& qualname) {
+    nb::gil_scoped_release release;
+    const std::uintptr_t lo = reinterpret_cast<std::uintptr_t>(this) & page_mask();
+    const std::uintptr_t hi = (reinterpret_cast<std::uintptr_t>(this) + sizeof(BenchmarkManager) + getpagesize() - 1) & page_mask();
+
+    nb::callable kernel;
+    std::exception_ptr thread_exception;
+    int sock = mSupervisorSock;
+
+    // make the BenchmarkManager inaccessible
+    protect_range(reinterpret_cast<void*>(lo), hi - lo, PROT_NONE);
+    // TODO make stack inaccessible (may be impossible) or read-only during the call
+    // call the python kernel generation function from a different thread.
+
+    std::thread make_kernel_thread([&]() {
+        try {
+            if (sock >= 0) {
+                try {
+                    seccomp_install_memory_notify(sock, lo, hi);
+                } catch (...) {
+                    close(sock);
+                    sock = -1;
+                    throw;
+                }
+                close(sock);
+                sock = -1;
+            }
+            nb::gil_scoped_acquire guard;
+            kernel = kernel_from_qualname(qualname);
+        } catch (...) {
+            thread_exception = std::current_exception();
+        }
+    });
+
+    make_kernel_thread.join();
+    // make it accessible again. This is in the original thread, so the tightened seccomp
+    // policy does not apply here.
+    protect_range(reinterpret_cast<void*>(lo), hi - lo, PROT_READ | PROT_WRITE);
+    // closed now, so set to -1
+    mSupervisorSock = -1;
+
+    if (thread_exception) {
+        std::rethrow_exception(thread_exception);
+    }
+
+    return kernel;
+}
+
 void BenchmarkManager::do_bench_py(
         const std::string& kernel_qualname,
         const std::vector<nb::tuple>& args,
@@ -311,7 +376,7 @@ void BenchmarkManager::do_bench_py(
 
     // at this point, we call user code as we import the kernel (executing arbitrary top-level code)
     // after this, we cannot trust python anymore
-    nb::callable kernel = kernel_from_qualname(kernel_qualname);
+    nb::callable kernel = get_kernel(kernel_qualname);
 
     // ok, first run for compilations etc
     nvtx_push("warmup");
@@ -400,6 +465,16 @@ void BenchmarkManager::do_bench_py(
     // subtract the nuisance shift that we applied to the counter
     error_count -= mErrorCountShift;
 
+    #ifdef ENABLE_EXPLOIT_TARGET
+    if (mExploitCanary != 0xDEADBEEFCAFEBABE) {
+        fprintf(mOutputPipe, "error-count\t%u\n", 0);
+        for (int i = 0; i < actual_calls; i++) {
+            fprintf(mOutputPipe, "%d\t%f\n", test_order.at(i) - 1, 10.f);
+        }
+    } else {
+        fprintf(mOutputPipe, "error-count\t%u\n", 42424242);
+    }
+    #else
     if (error_count > 0) {
         fprintf(mOutputPipe, "error-count\t%u\n", error_count);
     }
@@ -409,6 +484,8 @@ void BenchmarkManager::do_bench_py(
         CUDA_CHECK(cudaEventElapsedTime(&duration, mStartEvents.at(i), mEndEvents.at(i)));
         fprintf(mOutputPipe, "%d\t%f\n", test_order.at(i) - 1, duration * 1000);
     }
+    #endif
+
     fprintf(mOutputPipe, "signature\t");
     fwrite(mSignature.data(), 1, 32, mOutputPipe);
     fputc('\n', mOutputPipe);
