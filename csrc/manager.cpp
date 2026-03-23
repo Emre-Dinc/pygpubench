@@ -317,7 +317,7 @@ void protect_range(void* ptr, size_t size, int prot) {
         throw std::system_error(errno, std::system_category(), "mprotect");
 }
 
-nb::callable BenchmarkManager::get_kernel(const std::string& qualname) {
+nb::callable BenchmarkManager::get_kernel(const std::string& qualname, nb::tuple call_args) {
     nb::gil_scoped_release release;
     const std::uintptr_t lo = reinterpret_cast<std::uintptr_t>(this) & page_mask();
     const std::uintptr_t hi = (reinterpret_cast<std::uintptr_t>(this) + sizeof(BenchmarkManager) + getpagesize() - 1) & page_mask();
@@ -326,12 +326,14 @@ nb::callable BenchmarkManager::get_kernel(const std::string& qualname) {
     std::exception_ptr thread_exception;
     int sock = mSupervisorSock;
 
+    nvtx_push("trigger-compile");
+
     // make the BenchmarkManager inaccessible
     protect_range(reinterpret_cast<void*>(lo), hi - lo, PROT_NONE);
     // TODO make stack inaccessible (may be impossible) or read-only during the call
     // call the python kernel generation function from a different thread.
 
-    std::thread make_kernel_thread([&]() {
+    std::thread make_kernel_thread([&kernel, &sock, lo, hi, qualname, call_args, &thread_exception]() {
         try {
             if (sock >= 0) {
                 try {
@@ -346,6 +348,11 @@ nb::callable BenchmarkManager::get_kernel(const std::string& qualname) {
             }
             nb::gil_scoped_acquire guard;
             kernel = kernel_from_qualname(qualname);
+
+            // ok, first run for compilations etc
+            CUDA_CHECK(cudaDeviceSynchronize());
+            kernel(*call_args);
+            CUDA_CHECK(cudaDeviceSynchronize());
         } catch (...) {
             thread_exception = std::current_exception();
         }
@@ -357,6 +364,7 @@ nb::callable BenchmarkManager::get_kernel(const std::string& qualname) {
     protect_range(reinterpret_cast<void*>(lo), hi - lo, PROT_READ | PROT_WRITE);
     // closed now, so set to -1
     mSupervisorSock = -1;
+    nvtx_pop();
 
     if (thread_exception) {
         std::rethrow_exception(thread_exception);
@@ -376,14 +384,7 @@ void BenchmarkManager::do_bench_py(
 
     // at this point, we call user code as we import the kernel (executing arbitrary top-level code)
     // after this, we cannot trust python anymore
-    nb::callable kernel = get_kernel(kernel_qualname);
-
-    // ok, first run for compilations etc
-    nvtx_push("warmup");
-    CUDA_CHECK(cudaDeviceSynchronize());
-    kernel(*args.at(0));
-    CUDA_CHECK(cudaDeviceSynchronize());
-    nvtx_pop();
+    nb::callable kernel = get_kernel(kernel_qualname, args.at(0));
 
     // now, run a few more times for warmup; in total aim for 1 second of warmup runs
     int actual_calls = run_warmup(kernel, args.at(0), stream);
