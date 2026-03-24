@@ -97,7 +97,7 @@ private:
 
     void install_protections();
     int run_warmup(nb::callable& kernel, const nb::tuple& args, cudaStream_t stream);
-    nb::callable get_kernel(const std::string& qualname, nb::tuple call_args);
+    nb::callable get_kernel(const std::string& qualname, const nb::tuple& call_args);
 
 
     // debug only: Any sort of test exploit that targets specific values of this class is going to be brittle,

@@ -317,7 +317,7 @@ void protect_range(void* ptr, size_t size, int prot) {
         throw std::system_error(errno, std::system_category(), "mprotect");
 }
 
-nb::callable BenchmarkManager::get_kernel(const std::string& qualname, nb::tuple call_args) {
+nb::callable BenchmarkManager::get_kernel(const std::string& qualname, const nb::tuple& call_args) {
     nb::gil_scoped_release release;
     const std::uintptr_t lo = reinterpret_cast<std::uintptr_t>(this) & page_mask();
     const std::uintptr_t hi = (reinterpret_cast<std::uintptr_t>(this) + sizeof(BenchmarkManager) + getpagesize() - 1) & page_mask();
@@ -333,18 +333,16 @@ nb::callable BenchmarkManager::get_kernel(const std::string& qualname, nb::tuple
     // TODO make stack inaccessible (may be impossible) or read-only during the call
     // call the python kernel generation function from a different thread.
 
-    std::thread make_kernel_thread([&kernel, &sock, lo, hi, qualname, call_args, &thread_exception]() {
+    std::thread make_kernel_thread([&kernel, sock, lo, hi, qualname, &call_args, &thread_exception]() {
         try {
             if (sock >= 0) {
                 try {
                     seccomp_install_memory_notify(sock, lo, hi);
                 } catch (...) {
                     close(sock);
-                    sock = -1;
                     throw;
                 }
                 close(sock);
-                sock = -1;
             }
             nb::gil_scoped_acquire guard;
             kernel = kernel_from_qualname(qualname);
