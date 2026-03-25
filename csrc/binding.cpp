@@ -8,7 +8,6 @@
 #include <utility>
 #include <random>
 #include "manager.h"
-#include "mmap_make_unique.h"
 
 int supervisor_main(int sock_fd);
 
@@ -22,7 +21,7 @@ void do_bench(int result_fd, int input_fd, const std::string& kernel_qualname, c
     std::mt19937 rng(std::random_device{}());
     signature.allocate(32, rng);
     auto config = read_benchmark_parameters(input_fd, signature.data());
-    auto mgr = mmap_make_unique<BenchmarkManager>(result_fd, std::move(signature), config.Seed, discard, nvtx, landlock, mseal, supervisor_sock_fd);
+    auto mgr = make_benchmark_manager(result_fd, std::move(signature), config.Seed, discard, nvtx, landlock, mseal, supervisor_sock_fd);
     auto [args, expected] = mgr->setup_benchmark(nb::cast<nb::callable>(test_generator), test_kwargs, config.Repeats);
     mgr->do_bench_py(kernel_qualname, args, expected, reinterpret_cast<cudaStream_t>(stream));
 }
