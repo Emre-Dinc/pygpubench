@@ -21,6 +21,9 @@
 
 static constexpr std::size_t ArenaSize = 2 * 1024 * 1024;
 
+/// Size of the memory used for the benchmark manager's memory (both direct and indirect)
+static constexpr std::size_t BenchmarkManagerArenaSize = 128 * 1024 * 1024;
+
 extern void clear_cache(void* dummy_memory, int size, bool discard, cudaStream_t stream);
 extern void install_landlock();
 extern bool mseal_supported();
@@ -122,8 +125,62 @@ BenchmarkParameters read_benchmark_parameters(int input_fd, void* signature_out)
     return {seed, static_cast<int>(repeats)};
 }
 
-BenchmarkManager::BenchmarkManager(int result_fd, ObfuscatedHexDigest signature, std::uint64_t seed, bool discard,
-                                   bool nvtx, bool landlock, bool mseal, int supervisor_socket) : mSignature(std::move(signature)), mSupervisorSock(supervisor_socket) {
+void BenchmarkManagerDeleter::operator()(BenchmarkManager* p) const noexcept {
+    p->~BenchmarkManager();
+    if (munmap(static_cast<void*>(p), this->ArenaSize) != 0) {
+        std::perror("munmap failed in BenchmarkManagerDeleter");
+        std::terminate();
+    }
+}
+
+
+BenchmarkManagerPtr make_benchmark_manager(
+    int result_fd, ObfuscatedHexDigest signature, std::uint64_t seed,
+    bool discard, bool nvtx, bool landlock, bool mseal, int supervisor_socket)
+{
+    const std::size_t page_size = static_cast<std::size_t>(getpagesize());
+    const std::size_t alloc_size = (BenchmarkManagerArenaSize + page_size - 1) & ~(page_size - 1);
+
+    void* mem = mmap(nullptr, alloc_size, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (mem == MAP_FAILED) {
+        throw std::system_error(errno, std::generic_category(), "mmap failed for BenchmarkManager");
+    }
+
+    BenchmarkManager* raw = nullptr;
+    try {
+        raw = new (mem) BenchmarkManager(
+            static_cast<std::byte*>(mem), alloc_size,
+            result_fd, std::move(signature), seed,
+            discard, nvtx, landlock, mseal, supervisor_socket);
+    } catch (...) {
+        // If construction throws, release the mmap'd region before propagating.
+        if (munmap(mem, alloc_size) != 0) {
+            std::perror("munmap failed in BenchmarkManager");
+        }
+        throw;
+    }
+    return {raw, BenchmarkManagerDeleter{alloc_size}};
+}
+
+
+
+BenchmarkManager::BenchmarkManager(std::byte* arena, std::size_t arena_size,
+                                   int result_fd, ObfuscatedHexDigest signature, std::uint64_t seed, bool discard,
+                                   bool nvtx, bool landlock, bool mseal, int supervisor_socket)
+    : mArena(arena),
+      mResource(arena + sizeof(BenchmarkManager),
+          arena_size - sizeof(BenchmarkManager),
+          std::pmr::null_memory_resource()),
+
+      mSignature(std::move(signature)),
+      mSupervisorSock(supervisor_socket),
+      mStartEvents(&mResource),
+      mEndEvents(&mResource),
+      mExpectedOutputs(&mResource),
+      mShadowArguments(&mResource),
+      mOutputBuffers(&mResource)
+{
     int device;
     CUDA_CHECK(cudaGetDevice(&device));
     CUDA_CHECK(cudaDeviceGetAttribute(&mL2CacheSize, cudaDevAttrL2CacheSize, device));
@@ -141,6 +198,7 @@ BenchmarkManager::BenchmarkManager(int result_fd, ObfuscatedHexDigest signature,
     mDiscardCache = discard;
     mSeed = seed;
 }
+
 
 BenchmarkManager::~BenchmarkManager() {
     if (mOutputPipe) {
@@ -183,12 +241,13 @@ bool can_convert_to_tensor(nb::handle obj) {
     return nb::isinstance<nb_cuda_array>(obj);
 }
 
-auto BenchmarkManager::make_shadow_args(const nb::tuple& args, cudaStream_t stream) -> std::vector<std::optional<ShadowArgument>> {
-    std::vector<std::optional<ShadowArgument>> shadow_args(args.size());
+auto BenchmarkManager::make_shadow_args(const nb::tuple& args, cudaStream_t stream,
+                                        std::pmr::memory_resource* resource) -> ShadowArgumentList {
+    ShadowArgumentList shadow_args(args.size(), resource);
     int nargs = args.size();
     std::random_device rd;
     std::mt19937 gen(rd());
-    std::uniform_int_distribution<unsigned> canary_seed_dist(0,  0xffffffff);
+    std::uniform_int_distribution<unsigned> canary_seed_dist(0, 0xffffffff);
     for (int i = 1; i < nargs; i++) {
         if (can_convert_to_tensor(args[i])) {
             nb_cuda_array arr = nb::cast<nb_cuda_array>(args[i]);
@@ -317,35 +376,40 @@ void protect_range(void* ptr, size_t size, int prot) {
         throw std::system_error(errno, std::system_category(), "mprotect");
 }
 
-nb::callable BenchmarkManager::get_kernel(const std::string& qualname) {
+nb::callable BenchmarkManager::get_kernel(const std::string& qualname, const nb::tuple& call_args) {
     nb::gil_scoped_release release;
-    const std::uintptr_t lo = reinterpret_cast<std::uintptr_t>(this) & page_mask();
-    const std::uintptr_t hi = (reinterpret_cast<std::uintptr_t>(this) + sizeof(BenchmarkManager) + getpagesize() - 1) & page_mask();
+    const std::uintptr_t lo = reinterpret_cast<std::uintptr_t>(this->mArena);
+    const std::uintptr_t hi = lo + BenchmarkManagerArenaSize;
 
     nb::callable kernel;
     std::exception_ptr thread_exception;
     int sock = mSupervisorSock;
+
+    nvtx_push("trigger-compile");
 
     // make the BenchmarkManager inaccessible
     protect_range(reinterpret_cast<void*>(lo), hi - lo, PROT_NONE);
     // TODO make stack inaccessible (may be impossible) or read-only during the call
     // call the python kernel generation function from a different thread.
 
-    std::thread make_kernel_thread([&]() {
+    std::thread make_kernel_thread([&kernel, sock, lo, hi, qualname, &call_args, &thread_exception]() {
         try {
             if (sock >= 0) {
                 try {
                     seccomp_install_memory_notify(sock, lo, hi);
                 } catch (...) {
                     close(sock);
-                    sock = -1;
                     throw;
                 }
                 close(sock);
-                sock = -1;
             }
             nb::gil_scoped_acquire guard;
             kernel = kernel_from_qualname(qualname);
+
+            // ok, first run for compilations etc
+            CUDA_CHECK(cudaDeviceSynchronize());
+            kernel(*call_args);
+            CUDA_CHECK(cudaDeviceSynchronize());
         } catch (...) {
             thread_exception = std::current_exception();
         }
@@ -357,6 +421,7 @@ nb::callable BenchmarkManager::get_kernel(const std::string& qualname) {
     protect_range(reinterpret_cast<void*>(lo), hi - lo, PROT_READ | PROT_WRITE);
     // closed now, so set to -1
     mSupervisorSock = -1;
+    nvtx_pop();
 
     if (thread_exception) {
         std::rethrow_exception(thread_exception);
@@ -376,14 +441,7 @@ void BenchmarkManager::do_bench_py(
 
     // at this point, we call user code as we import the kernel (executing arbitrary top-level code)
     // after this, we cannot trust python anymore
-    nb::callable kernel = get_kernel(kernel_qualname);
-
-    // ok, first run for compilations etc
-    nvtx_push("warmup");
-    CUDA_CHECK(cudaDeviceSynchronize());
-    kernel(*args.at(0));
-    CUDA_CHECK(cudaDeviceSynchronize());
-    nvtx_pop();
+    nb::callable kernel = get_kernel(kernel_qualname, args.at(0));
 
     // now, run a few more times for warmup; in total aim for 1 second of warmup runs
     int actual_calls = run_warmup(kernel, args.at(0), stream);
@@ -516,7 +574,7 @@ void BenchmarkManager::setup_test_cases( const std::vector<nb::tuple>& args, con
 
     // Generate "shadow" copies of input arguments
     for (const auto & arg : args) {
-        mShadowArguments.emplace_back(make_shadow_args(arg, stream));
+        mShadowArguments.emplace_back(make_shadow_args(arg, stream, &mResource));
     }
 
     // prepare expected outputs

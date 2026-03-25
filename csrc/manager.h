@@ -9,7 +9,10 @@
 #include <chrono>
 #include <cstdio>
 #include <fstream>
+#include <memory_resource>
+#include <vector>
 #include <cuda_runtime.h>
+#include <memory>
 #include <optional>
 #include <nanobind/nanobind.h>
 #include "nanobind/ndarray.h"
@@ -27,13 +30,37 @@ struct BenchmarkParameters {
 
 BenchmarkParameters read_benchmark_parameters(int input_fd, void* signature_out);
 
+class BenchmarkManager;
+
+/// RAII handle for a BenchmarkManager that was placement-newed into an mmap arena.
+/// Destructs the object and releases the arena (munmap) automatically.
+struct BenchmarkManagerDeleter {
+    std::size_t ArenaSize = 0;  ///< total mmap size, needed for munmap on destruction
+
+    void operator()(BenchmarkManager* p) const noexcept;
+};
+using BenchmarkManagerPtr = std::unique_ptr<BenchmarkManager, BenchmarkManagerDeleter>;
+
+BenchmarkManagerPtr make_benchmark_manager(
+    int result_fd, ObfuscatedHexDigest signature, std::uint64_t seed,
+    bool discard, bool nvtx, bool landlock, bool mseal, int supervisor_socket);
+
+
 class BenchmarkManager {
 public:
-    BenchmarkManager(int result_fd, ObfuscatedHexDigest signature, std::uint64_t seed, bool discard, bool nvtx, bool landlock, bool mseal, int supervisor_socket);
-    ~BenchmarkManager();
     std::pair<std::vector<nb::tuple>, std::vector<nb::tuple>> setup_benchmark(const nb::callable& generate_test_case, const nb::dict& kwargs, int repeats);
     void do_bench_py(const std::string& kernel_qualname, const std::vector<nb::tuple>& args, const std::vector<nb::tuple>& expected, cudaStream_t stream);
 private:
+    friend BenchmarkManagerPtr make_benchmark_manager(int result_fd, ObfuscatedHexDigest signature, std::uint64_t seed, bool discard, bool nvtx, bool landlock, bool mseal, int supervisor_socket);
+    friend BenchmarkManagerDeleter;
+    /// `arena` is the mmap region that owns all memory for this object and its vectors.
+    /// The BenchmarkManager must have been placement-newed into the front of that region;
+    /// the rest is used as a monotonic PMR arena for internal vectors.
+    BenchmarkManager(std::byte* arena, std::size_t arena_size,
+                     int result_fd, ObfuscatedHexDigest signature, std::uint64_t seed,
+                     bool discard, bool nvtx, bool landlock, bool mseal, int supervisor_socket);
+    ~BenchmarkManager();
+
     struct Expected {
         enum EMode {
             ExactMatch,
@@ -56,13 +83,19 @@ private:
         ShadowArgument& operator=(ShadowArgument&& other) noexcept;
     };
 
-    using ShadowArgumentList = std::vector<std::optional<ShadowArgument>>;
+    using ShadowArgumentList = std::pmr::vector<std::optional<ShadowArgument>>;
+
+    // Owns the mmap region this object lives in.
+    std::byte* mArena;
+    // Monotonic resource over the remainder of the arena (after sizeof(BenchmarkManager)).
+    // Must be constructed before the pmr vectors below.
+    std::pmr::monotonic_buffer_resource mResource;
 
     double mWarmupSeconds = 1.0;
     double mBenchmarkSeconds = 1.0;
 
-    std::vector<cudaEvent_t> mStartEvents;
-    std::vector<cudaEvent_t> mEndEvents;
+    std::pmr::vector<cudaEvent_t> mStartEvents;
+    std::pmr::vector<cudaEvent_t> mEndEvents;
 
     std::chrono::high_resolution_clock::time_point mCPUStart;
 
@@ -77,14 +110,15 @@ private:
     bool mSeal = true;
     int mSupervisorSock = -1;
     std::uint64_t mSeed = -1;
-    std::vector<Expected> mExpectedOutputs;
-    std::vector<ShadowArgumentList> mShadowArguments;
-    std::vector<nb_cuda_array> mOutputBuffers;
+    std::pmr::vector<Expected> mExpectedOutputs;
+    std::pmr::vector<ShadowArgumentList> mShadowArguments;
+    std::pmr::vector<nb_cuda_array> mOutputBuffers;
 
     FILE* mOutputPipe = nullptr;
     ObfuscatedHexDigest mSignature;
 
-    static ShadowArgumentList make_shadow_args(const nb::tuple& args, cudaStream_t stream);
+    static ShadowArgumentList make_shadow_args(const nb::tuple& args, cudaStream_t stream,
+                                               std::pmr::memory_resource* resource);
 
     void nvtx_push(const char* name);
     void nvtx_pop();
@@ -97,7 +131,7 @@ private:
 
     void install_protections();
     int run_warmup(nb::callable& kernel, const nb::tuple& args, cudaStream_t stream);
-    nb::callable get_kernel(const std::string& qualname);
+    nb::callable get_kernel(const std::string& qualname, const nb::tuple& call_args);
 
 
     // debug only: Any sort of test exploit that targets specific values of this class is going to be brittle,
