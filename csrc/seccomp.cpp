@@ -7,6 +7,9 @@
 #include <unistd.h>
 #include <seccomp.h>
 
+#include "protect.h"
+#include "protocol.h"
+
 static inline void check_seccomp(int rc, const char* what) {
     if (rc < 0)
         throw std::system_error(-rc, std::generic_category(), what);
@@ -64,10 +67,23 @@ static int install_memory_notify_filter() {
 
 struct RangeMsg { uintptr_t lo, hi; };
 
-static void send_unotify_fd(int sock, int unotify_fd, uintptr_t lo, uintptr_t hi) {
-    RangeMsg range = { lo, hi };
-    struct iovec iov = { &range, sizeof(range) };
+static void send_unotify_fd(int sock, int unotify_fd,
+                            uintptr_t sensitive_lo, uintptr_t sensitive_hi) {
+    uint32_t n = __stop___allowed_mprotect - __start___allowed_mprotect;
 
+    SupervisorSetupMsg hdr { sensitive_lo, sensitive_hi, n };
+
+    // Send header + site array as regular data
+    if (send(sock, &hdr, sizeof(hdr), MSG_NOSIGNAL) != sizeof(hdr))
+        throw std::system_error(errno, std::system_category(), "send SupervisorSetupMsg");
+
+    size_t sites_sz = n * sizeof(AllowedSite);
+    if (send(sock, __start___allowed_mprotect, sites_sz, MSG_NOSIGNAL) != (ssize_t)sites_sz)
+        throw std::system_error(errno, std::system_category(), "send AllowedSite[]");
+
+    // Send unotify_fd via SCM_RIGHTS
+    char dummy = 0;
+    struct iovec iov = { &dummy, 1 };
     union {
         char buf[CMSG_SPACE(sizeof(int))];
         struct cmsghdr align;
@@ -86,8 +102,8 @@ static void send_unotify_fd(int sock, int unotify_fd, uintptr_t lo, uintptr_t hi
     cmsg->cmsg_len   = CMSG_LEN(sizeof(int));
     memcpy(CMSG_DATA(cmsg), &unotify_fd, sizeof(int));
 
-    if (sendmsg(sock, &msg, 0) < 0)
-        throw std::system_error(errno, std::system_category(), "sendmsg");
+    if (sendmsg(sock, &msg, MSG_NOSIGNAL) < 0)
+        throw std::system_error(errno, std::system_category(), "sendmsg unotify_fd");
 }
 
 // ---------------------------------------------------------------------------

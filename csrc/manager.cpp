@@ -395,13 +395,13 @@ nb::callable BenchmarkManager::initial_kernel_setup(double& time_estimate, const
 
     nvtx_push("trigger-compile");
     PROTECT_RANGE(lo, hi-lo, PROT_NONE);
-
+    setup_seccomp(sock, install_notify, lo, hi);
     {
         nb::gil_scoped_release release;
         std::thread worker([&] {
             try {
                 CUDA_CHECK(cudaSetDevice(device));
-                setup_seccomp(sock, install_notify, lo, hi);
+
 
                 nb::gil_scoped_acquire guard;
 
@@ -419,7 +419,10 @@ nb::callable BenchmarkManager::initial_kernel_setup(double& time_estimate, const
         worker.join();
     }
 
+    void* ip = __builtin_return_address(0);
+    fprintf(stdout, "UNDO PROT: %p\n", ip);
     PROTECT_RANGE(lo, hi - lo, PROT_READ | PROT_WRITE);
+    fprintf(stdout, "DONE PROT\n");
     mSupervisorSock = -1;
     nvtx_pop();
 

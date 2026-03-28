@@ -44,5 +44,5 @@
                 std::system_category(), "mprotect");                          \
     } while(0)
 
-extern unsigned long __start___allowed[];
-extern unsigned long __stop___allowed[];
+extern unsigned long __start___allowed_mprotect[];
+extern unsigned long __stop___allowed_mprotect[];
