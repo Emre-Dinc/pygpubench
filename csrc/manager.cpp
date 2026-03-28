@@ -137,7 +137,7 @@ void BenchmarkManagerDeleter::operator()(BenchmarkManager* p) const noexcept {
 
 
 BenchmarkManagerPtr make_benchmark_manager(
-    int result_fd, ObfuscatedHexDigest signature, std::uint64_t seed,
+    int result_fd, const std::vector<char>& signature, std::uint64_t seed,
     bool discard, bool nvtx, bool landlock, bool mseal, int supervisor_socket)
 {
     const std::size_t page_size = static_cast<std::size_t>(getpagesize());
@@ -153,7 +153,7 @@ BenchmarkManagerPtr make_benchmark_manager(
     try {
         raw = new (mem) BenchmarkManager(
             static_cast<std::byte*>(mem), alloc_size,
-            result_fd, std::move(signature), seed,
+            result_fd, signature, seed,
             discard, nvtx, landlock, mseal, supervisor_socket);
     } catch (...) {
         // If construction throws, release the mmap'd region before propagating.
@@ -168,14 +168,14 @@ BenchmarkManagerPtr make_benchmark_manager(
 
 
 BenchmarkManager::BenchmarkManager(std::byte* arena, std::size_t arena_size,
-                                   int result_fd, ObfuscatedHexDigest signature, std::uint64_t seed, bool discard,
+                                   int result_fd, const std::vector<char>& signature, std::uint64_t seed, bool discard,
                                    bool nvtx, bool landlock, bool mseal, int supervisor_socket)
     : mArena(arena),
       mResource(arena + sizeof(BenchmarkManager),
           arena_size - sizeof(BenchmarkManager),
           std::pmr::null_memory_resource()),
 
-      mSignature(std::move(signature)),
+      mSignature(&mResource),
       mSupervisorSock(supervisor_socket),
       mStartEvents(&mResource),
       mEndEvents(&mResource),
@@ -200,6 +200,10 @@ BenchmarkManager::BenchmarkManager(std::byte* arena, std::size_t arena_size,
     mSeal = mseal;
     mDiscardCache = discard;
     mSeed = seed;
+    std::random_device rd;
+    std::mt19937 rng(rd());
+    mSignature.allocate(32, rng);
+    std::copy(signature.begin(), signature.end(), mSignature.data());
 }
 
 
@@ -498,6 +502,7 @@ void BenchmarkManager::do_bench_py(
     randomize_before_test(actual_calls, rng, stream);
     // from this point on, even the benchmark thread won't write to the arena anymore
     protect_range(mArena, BenchmarkManagerArenaSize, PROT_READ);
+    mSignature.lock();  // also, make the key fully inaccessible
 
     std::uniform_int_distribution<unsigned> check_seed_generator(0,  0xffffffff);
 
@@ -547,7 +552,9 @@ void BenchmarkManager::send_report() {
     error_count -= mErrorCountShift;
 
     std::string message = build_result_message(mTestOrder, error_count, mMedianEventTime);
+    mSignature.unlock();
     message = encrypt_message(mSignature.data(), 32, message);
+    mSignature.lock();
     fwrite(message.data(), 1, message.size(), mOutputPipe);
     fflush(mOutputPipe);
 }

@@ -19,11 +19,11 @@ namespace nb = nanobind;
 void do_bench(int result_fd, int input_fd, const std::string& kernel_qualname, const nb::object& test_generator,
               const nb::dict& test_kwargs, std::uintptr_t stream, bool discard, bool nvtx, bool landlock, bool mseal,
               int supervisor_sock_fd) {
-    ObfuscatedHexDigest signature;
     std::mt19937 rng(std::random_device{}());
-    signature.allocate(32, rng);
-    auto config = read_benchmark_parameters(input_fd, signature.data());
-    auto mgr = make_benchmark_manager(result_fd, std::move(signature), config.Seed, discard, nvtx, landlock, mseal, supervisor_sock_fd);
+    std::vector<char> signature_bytes(32);
+    auto config = read_benchmark_parameters(input_fd, signature_bytes.data());
+    auto mgr = make_benchmark_manager(result_fd, signature_bytes, config.Seed, discard, nvtx, landlock, mseal, supervisor_sock_fd);
+    cleanse(signature_bytes.data(), 32);
 
     {
         nb::gil_scoped_release release;

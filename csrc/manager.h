@@ -42,7 +42,7 @@ struct BenchmarkManagerDeleter {
 using BenchmarkManagerPtr = std::unique_ptr<BenchmarkManager, BenchmarkManagerDeleter>;
 
 BenchmarkManagerPtr make_benchmark_manager(
-    int result_fd, ObfuscatedHexDigest signature, std::uint64_t seed,
+    int result_fd, const std::vector<char>& signature, std::uint64_t seed,
     bool discard, bool nvtx, bool landlock, bool mseal, int supervisor_socket);
 
 
@@ -53,13 +53,13 @@ public:
     void send_report();
     void clean_up();
 private:
-    friend BenchmarkManagerPtr make_benchmark_manager(int result_fd, ObfuscatedHexDigest signature, std::uint64_t seed, bool discard, bool nvtx, bool landlock, bool mseal, int supervisor_socket);
+    friend BenchmarkManagerPtr make_benchmark_manager(int result_fd, const std::vector<char>& signature, std::uint64_t seed, bool discard, bool nvtx, bool landlock, bool mseal, int supervisor_socket);
     friend BenchmarkManagerDeleter;
     /// `arena` is the mmap region that owns all memory for this object and its vectors.
     /// The BenchmarkManager must have been placement-newed into the front of that region;
     /// the rest is used as a monotonic PMR arena for internal vectors.
     BenchmarkManager(std::byte* arena, std::size_t arena_size,
-                     int result_fd, ObfuscatedHexDigest signature, std::uint64_t seed,
+                     int result_fd, const std::vector<char>& signature, std::uint64_t seed,
                      bool discard, bool nvtx, bool landlock, bool mseal, int supervisor_socket);
     ~BenchmarkManager();
 
