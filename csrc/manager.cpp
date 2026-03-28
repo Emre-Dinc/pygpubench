@@ -402,7 +402,6 @@ nb::callable BenchmarkManager::initial_kernel_setup(double& time_estimate, const
             try {
                 CUDA_CHECK(cudaSetDevice(device));
 
-
                 nb::gil_scoped_acquire guard;
 
                 kernel = kernel_from_qualname(qualname);
@@ -419,10 +418,7 @@ nb::callable BenchmarkManager::initial_kernel_setup(double& time_estimate, const
         worker.join();
     }
 
-    void* ip = __builtin_return_address(0);
-    fprintf(stdout, "UNDO PROT: %p\n", ip);
     PROTECT_RANGE(lo, hi - lo, PROT_READ | PROT_WRITE);
-    fprintf(stdout, "DONE PROT\n");
     mSupervisorSock = -1;
     nvtx_pop();
 

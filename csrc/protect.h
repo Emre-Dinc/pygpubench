@@ -18,7 +18,7 @@
 // Because numeric labels are reusable, each expansion of this macro gets its own
 // independent "1:" with no clashes, making it safe to use at multiple call sites.
 //
-#define PROTECT_RANGE(ptr, size, prot)                                        \
+#define PROTECT_RANGE_MARKED(ptr, size, prot)                                 \
     do {                                                                      \
         const uintptr_t _page = static_cast<uintptr_t>(getpagesize());        \
         uintptr_t _start = reinterpret_cast<uintptr_t>(ptr) & ~(_page - 1);   \
@@ -42,6 +42,42 @@
             throw std::system_error(                                          \
                 static_cast<int>(-_ret),                                      \
                 std::system_category(), "mprotect");                          \
+    } while(0)
+
+// if prot==PROT_NONE, there's no seccomp filtering, so we don't need to
+// register the callsite.
+#define PROTECT_RANGE_NONE(ptr, size)                                         \
+    do {                                                                      \
+        const uintptr_t _page = static_cast<uintptr_t>(getpagesize());        \
+        uintptr_t _start = reinterpret_cast<uintptr_t>(ptr) & ~(_page - 1);   \
+        uintptr_t _end   = (reinterpret_cast<uintptr_t>(ptr)                  \
+                           + static_cast<uintptr_t>(size) + _page - 1)        \
+                           & ~(_page - 1);                                    \
+        long _ret;                                                            \
+        asm volatile (                                                        \
+            "syscall\n\t"                                                     \
+            : "=a"(_ret)                                                      \
+            : "0"(__NR_mprotect),                                             \
+              "D"(_start),                                                    \
+              "S"(_end - _start),                                             \
+              "d"(static_cast<long>(PROT_NONE))                               \
+            : "rcx", "r11", "memory"                                          \
+        );                                                                    \
+        if (_ret < 0)                                                         \
+            throw std::system_error(                                          \
+                static_cast<int>(-_ret),                                      \
+                std::system_category(), "mprotect");                          \
+    } while(0)
+
+
+#define PROTECT_RANGE(ptr, size, prot)                                        \
+    do {                                                                      \
+        constexpr int PROT = prot;                                            \
+        if constexpr (PROT == PROT_NONE) {                                    \
+            PROTECT_RANGE_NONE(ptr, size);                                    \
+        } else {                                                              \
+            PROTECT_RANGE_MARKED(ptr, size, PROT);                            \
+        }                                                                     \
     } while(0)
 
 extern unsigned long __start___allowed_mprotect[];
