@@ -387,43 +387,22 @@ nb::callable BenchmarkManager::initial_kernel_setup(double& time_estimate, const
     void* const cc_memory = mDeviceDummyMemory;
     const std::size_t l2_clear_size = mL2CacheSize;
     const bool discard_cache = mDiscardCache;
-    int device;
-    CUDA_CHECK(cudaGetDevice(&device));
-
-    nb::callable kernel;
-    std::exception_ptr thread_exception;
 
     nvtx_push("trigger-compile");
     PROTECT_RANGE(lo, hi-lo, PROT_NONE);
     setup_seccomp(sock, install_notify, lo, hi);
-    {
-        nb::gil_scoped_release release;
-        std::thread worker([&] {
-            try {
-                CUDA_CHECK(cudaSetDevice(device));
 
-                nb::gil_scoped_acquire guard;
+    nb::callable kernel = kernel_from_qualname(qualname);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    kernel(*call_args);  // trigger JIT compile
 
-                kernel = kernel_from_qualname(qualname);
-                CUDA_CHECK(cudaDeviceSynchronize());
-                kernel(*call_args);  // trigger JIT compile
-
-                time_estimate = run_warmup_loop(kernel, call_args, stream,
-                                                cc_memory, l2_clear_size, discard_cache,
-                                                warmup_seconds);
-            } catch (...) {
-                thread_exception = std::current_exception();
-            }
-        });
-        worker.join();
-    }
+    time_estimate = run_warmup_loop(kernel, call_args, stream,
+                                    cc_memory, l2_clear_size, discard_cache,
+                                    warmup_seconds);
 
     PROTECT_RANGE(lo, hi - lo, PROT_READ | PROT_WRITE);
     mSupervisorSock = -1;
     nvtx_pop();
-
-    if (thread_exception)
-        std::rethrow_exception(thread_exception);
 
     return kernel;
 }
