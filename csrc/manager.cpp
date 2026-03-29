@@ -19,6 +19,7 @@
 #include <nanobind/stl/string.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include "protect.h"
 
 static constexpr std::size_t ArenaSize = 2 * 1024 * 1024;
 
@@ -137,7 +138,7 @@ void BenchmarkManagerDeleter::operator()(BenchmarkManager* p) const noexcept {
 
 
 BenchmarkManagerPtr make_benchmark_manager(
-    int result_fd, ObfuscatedHexDigest signature, std::uint64_t seed,
+    int result_fd, const std::vector<char>& signature, std::uint64_t seed,
     bool discard, bool nvtx, bool landlock, bool mseal, int supervisor_socket)
 {
     const std::size_t page_size = static_cast<std::size_t>(getpagesize());
@@ -153,7 +154,7 @@ BenchmarkManagerPtr make_benchmark_manager(
     try {
         raw = new (mem) BenchmarkManager(
             static_cast<std::byte*>(mem), alloc_size,
-            result_fd, std::move(signature), seed,
+            result_fd, signature, seed,
             discard, nvtx, landlock, mseal, supervisor_socket);
     } catch (...) {
         // If construction throws, release the mmap'd region before propagating.
@@ -168,14 +169,14 @@ BenchmarkManagerPtr make_benchmark_manager(
 
 
 BenchmarkManager::BenchmarkManager(std::byte* arena, std::size_t arena_size,
-                                   int result_fd, ObfuscatedHexDigest signature, std::uint64_t seed, bool discard,
+                                   int result_fd, const std::vector<char>& signature, std::uint64_t seed, bool discard,
                                    bool nvtx, bool landlock, bool mseal, int supervisor_socket)
     : mArena(arena),
       mResource(arena + sizeof(BenchmarkManager),
           arena_size - sizeof(BenchmarkManager),
           std::pmr::null_memory_resource()),
 
-      mSignature(std::move(signature)),
+      mSignature(&mResource),
       mSupervisorSock(supervisor_socket),
       mStartEvents(&mResource),
       mEndEvents(&mResource),
@@ -195,11 +196,19 @@ BenchmarkManager::BenchmarkManager(std::byte* arena, std::size_t arena_size,
         throw std::runtime_error("Could not open output pipe");
     }
 
+    if (signature.size() != 32) {
+        throw std::invalid_argument("Invalid signature length");
+    }
+
     mNVTXEnabled = nvtx;
     mLandlock = landlock;
     mSeal = mseal;
     mDiscardCache = discard;
     mSeed = seed;
+    std::random_device rd;
+    std::mt19937 rng(rd());
+    mSignature.allocate(32, rng);
+    std::copy(signature.begin(), signature.end(), mSignature.data());
 }
 
 
@@ -337,18 +346,6 @@ void BenchmarkManager::install_protections() {
     install_seccomp_filter();
 }
 
-static inline std::uintptr_t page_mask() {
-    std::uintptr_t page_size = getpagesize();
-    return ~(page_size - 1u);
-}
-
-void protect_range(void* ptr, size_t size, int prot) {
-    std::uintptr_t start = reinterpret_cast<std::uintptr_t>(ptr) & page_mask();
-    std::uintptr_t end   = (reinterpret_cast<std::uintptr_t>(ptr) + size + getpagesize() - 1) & page_mask();
-    if (mprotect(reinterpret_cast<void*>(start), end - start, prot) < 0)
-        throw std::system_error(errno, std::system_category(), "mprotect");
-}
-
 static void setup_seccomp(int sock, bool install_notify, std::uintptr_t lo, std::uintptr_t hi) {
     if (sock < 0)
         return;
@@ -394,46 +391,44 @@ nb::callable BenchmarkManager::initial_kernel_setup(double& time_estimate, const
     void* const cc_memory = mDeviceDummyMemory;
     const std::size_t l2_clear_size = mL2CacheSize;
     const bool discard_cache = mDiscardCache;
-    int device;
-    CUDA_CHECK(cudaGetDevice(&device));
-
-    nb::callable kernel;
-    std::exception_ptr thread_exception;
 
     nvtx_push("trigger-compile");
-    protect_range(reinterpret_cast<void*>(lo), hi - lo, PROT_NONE);
+    PROTECT_RANGE(lo, hi-lo, PROT_NONE);
+    setup_seccomp(sock, install_notify, lo, hi);
 
-    {
-        nb::gil_scoped_release release;
-        std::thread worker([&] {
-            try {
-                CUDA_CHECK(cudaSetDevice(device));
-                setup_seccomp(sock, install_notify, lo, hi);
+    nb::callable kernel = kernel_from_qualname(qualname);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    kernel(*call_args);  // trigger JIT compile
 
-                nb::gil_scoped_acquire guard;
+    time_estimate = run_warmup_loop(kernel, call_args, stream,
+                                    cc_memory, l2_clear_size, discard_cache,
+                                    warmup_seconds);
 
-                kernel = kernel_from_qualname(qualname);
-                CUDA_CHECK(cudaDeviceSynchronize());
-                kernel(*call_args);  // trigger JIT compile
-
-                time_estimate = run_warmup_loop(kernel, call_args, stream,
-                                                cc_memory, l2_clear_size, discard_cache,
-                                                warmup_seconds);
-            } catch (...) {
-                thread_exception = std::current_exception();
-            }
-        });
-        worker.join();
-    }
-
-    protect_range(reinterpret_cast<void*>(lo), hi - lo, PROT_READ | PROT_WRITE);
+    PROTECT_RANGE(lo, hi - lo, PROT_READ | PROT_WRITE);
     mSupervisorSock = -1;
     nvtx_pop();
 
-    if (thread_exception)
-        std::rethrow_exception(thread_exception);
-
     return kernel;
+}
+
+void BenchmarkManager::randomize_before_test(int num_calls, std::mt19937& rng, cudaStream_t stream) {
+    // pick a random spot for the unsigned
+    // initialize the whole area with random junk; the error counter
+    // will be shifted by the initial value, so just writing zero
+    // won't result in passing the tests.
+    std::uniform_int_distribution<std::ptrdiff_t> dist(0, ArenaSize / sizeof(unsigned) - 1);
+    std::uniform_int_distribution<unsigned> noise_generator(0, std::numeric_limits<unsigned>::max());
+    std::vector<unsigned> noise(ArenaSize / sizeof(unsigned));
+    std::generate(noise.begin(), noise.end(), [&]() -> unsigned { return noise_generator(rng); });
+    CUDA_CHECK(cudaMemcpyAsync(mDeviceErrorBase, noise.data(), noise.size() * sizeof(unsigned), cudaMemcpyHostToDevice,  stream));
+    std::ptrdiff_t offset = dist(rng);
+    mDeviceErrorCounter = mDeviceErrorBase + offset;
+    mErrorCountShift = noise.at(offset);
+
+    // create a randomized order for running the tests
+    mTestOrder.resize(num_calls);
+    std::iota(mTestOrder.begin(), mTestOrder.end(), 1);
+    std::shuffle(mTestOrder.begin(), mTestOrder.end(), rng);
 }
 
 void BenchmarkManager::do_bench_py(
@@ -472,25 +467,13 @@ void BenchmarkManager::do_bench_py(
             "meaningful benchmark numbers: " + std::to_string(time_estimate));
     }
 
-    // pick a random spot for the unsigned
-    // initialize the whole area with random junk; the error counter
-    // will be shifted by the initial value, so just writing zero
-    // won't result in passing the tests.
     std::random_device rd;
     std::mt19937 rng(rd());
-    std::uniform_int_distribution<std::ptrdiff_t> dist(0, ArenaSize / sizeof(unsigned) - 1);
-    std::uniform_int_distribution<unsigned> noise_generator(0, std::numeric_limits<unsigned>::max());
-    std::vector<unsigned> noise(ArenaSize / sizeof(unsigned));
-    std::generate(noise.begin(), noise.end(), [&]() -> unsigned { return noise_generator(rng); });
-    CUDA_CHECK(cudaMemcpyAsync(mDeviceErrorBase, noise.data(), noise.size() * sizeof(unsigned), cudaMemcpyHostToDevice,  stream));
-    std::ptrdiff_t offset = dist(rng);
-    mDeviceErrorCounter = mDeviceErrorBase + offset;
-    mErrorCountShift = noise.at(offset);
 
-    // create a randomized order for running the tests
-    mTestOrder.resize(actual_calls);
-    std::iota(mTestOrder.begin(), mTestOrder.end(), 1);
-    std::shuffle(mTestOrder.begin(), mTestOrder.end(), rng);
+    randomize_before_test(actual_calls, rng, stream);
+    // from this point on, even the benchmark thread won't write to the arena anymore
+    PROTECT_RANGE(mArena, BenchmarkManagerArenaSize, PROT_READ);
+    PROTECT_RANGE(mSignature.page_ptr(), 4096, PROT_NONE);  // make the key fully inaccessible
 
     std::uniform_int_distribution<unsigned> check_seed_generator(0,  0xffffffff);
 
@@ -540,12 +523,18 @@ void BenchmarkManager::send_report() {
     error_count -= mErrorCountShift;
 
     std::string message = build_result_message(mTestOrder, error_count, mMedianEventTime);
+    PROTECT_RANGE(mSignature.page_ptr(), 4096, PROT_READ);
     message = encrypt_message(mSignature.data(), 32, message);
+    PROTECT_RANGE(mSignature.page_ptr(), 4096, PROT_WRITE);
+    cleanse(mSignature.data(), 32);
+    PROTECT_RANGE(mSignature.page_ptr(), 4096, PROT_NONE);
     fwrite(message.data(), 1, message.size(), mOutputPipe);
     fflush(mOutputPipe);
 }
 
 void BenchmarkManager::clean_up() {
+    PROTECT_RANGE(mArena, BenchmarkManagerArenaSize, PROT_READ | PROT_WRITE);
+
     for (auto& event : mStartEvents) CUDA_CHECK(cudaEventDestroy(event));
     for (auto& event : mEndEvents) CUDA_CHECK(cudaEventDestroy(event));
     mStartEvents.clear();

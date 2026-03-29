@@ -42,7 +42,7 @@ struct BenchmarkManagerDeleter {
 using BenchmarkManagerPtr = std::unique_ptr<BenchmarkManager, BenchmarkManagerDeleter>;
 
 BenchmarkManagerPtr make_benchmark_manager(
-    int result_fd, ObfuscatedHexDigest signature, std::uint64_t seed,
+    int result_fd, const std::vector<char>& signature, std::uint64_t seed,
     bool discard, bool nvtx, bool landlock, bool mseal, int supervisor_socket);
 
 
@@ -53,13 +53,13 @@ public:
     void send_report();
     void clean_up();
 private:
-    friend BenchmarkManagerPtr make_benchmark_manager(int result_fd, ObfuscatedHexDigest signature, std::uint64_t seed, bool discard, bool nvtx, bool landlock, bool mseal, int supervisor_socket);
+    friend BenchmarkManagerPtr make_benchmark_manager(int result_fd, const std::vector<char>& signature, std::uint64_t seed, bool discard, bool nvtx, bool landlock, bool mseal, int supervisor_socket);
     friend BenchmarkManagerDeleter;
     /// `arena` is the mmap region that owns all memory for this object and its vectors.
     /// The BenchmarkManager must have been placement-newed into the front of that region;
     /// the rest is used as a monotonic PMR arena for internal vectors.
     BenchmarkManager(std::byte* arena, std::size_t arena_size,
-                     int result_fd, ObfuscatedHexDigest signature, std::uint64_t seed,
+                     int result_fd, const std::vector<char>& signature, std::uint64_t seed,
                      bool discard, bool nvtx, bool landlock, bool mseal, int supervisor_socket);
     ~BenchmarkManager();
 
@@ -135,6 +135,7 @@ private:
     void setup_test_cases(const std::vector<nb::tuple>& args, const std::vector<nb::tuple>& expected, cudaStream_t stream);
 
     void install_protections();
+    void randomize_before_test(int num_calls, std::mt19937& rng, cudaStream_t stream);
     nb::callable initial_kernel_setup(double& time_estimate, const std::string& qualname, const nb::tuple& call_args, cudaStream_t stream);
 
     [[nodiscard]] std::string build_result_message(const std::pmr::vector<int>& test_order, unsigned error_count, float median_event_time) const;

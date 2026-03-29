@@ -3,19 +3,66 @@
 #include <cstdio>
 #include <cstring>
 #include <signal.h>
+#include <system_error>
+#include <vector>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/prctl.h>
 #include <linux/seccomp.h>
 #include <unistd.h>
+#include <syscall.h>
 
-struct RangeMsg { uintptr_t lo, hi; };
+#include "protocol.h"
+#include <sys/mman.h>
 
-static int recv_unotify_fd(int sock, uintptr_t& lo, uintptr_t& hi) {
-    RangeMsg range;
-    struct iovec iov = { &range, sizeof(range) };
+#ifdef DEBUG_SUPERVISOR
+#define dbgprint(...) fprintf(stdout, __VA_ARGS__)
+#else
+#define dbgprint(...)
+#endif
 
-    // Ancillary buffer for one fd
+struct Config {
+    uintptr_t sensitive_lo;
+    uintptr_t sensitive_hi;
+    std::vector<AllowedSite> allowed;
+};
+
+static void recv_all(int sock, void* buf, size_t len) {
+    auto* p = static_cast<char*>(buf);
+    while (len > 0) {
+        ssize_t n = recv(sock, p, len, MSG_WAITALL);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            throw std::system_error(errno, std::system_category(), "recv");
+        }
+        if (n == 0)
+            throw std::runtime_error("supervisor: connection closed unexpectedly");
+        p   += n;
+        len -= n;
+    }
+}
+
+static int recv_setup(int sock, Config& cfg) {
+    SupervisorSetupMsg setup;
+    recv_all(sock, &setup, sizeof(setup));
+
+    cfg.sensitive_lo = setup.sensitive_lo;
+    cfg.sensitive_hi = setup.sensitive_hi;
+    if (setup.n_allowed_sites > MAX_ALLOWED_SITES)
+        throw std::runtime_error("supervisor: too many allowed sites");
+
+    if (cfg.sensitive_lo >= cfg.sensitive_hi)
+        throw std::runtime_error("supervisor: invalid sensitive range");
+
+    cfg.allowed.resize(setup.n_allowed_sites);
+    if (setup.n_allowed_sites > 0) {
+        size_t sites_sz = setup.n_allowed_sites * sizeof(AllowedSite);
+        recv_all(sock, cfg.allowed.data(), sites_sz);
+    }
+
+    char dummy;
+    struct iovec iov = { &dummy, 1 };
+
     union {
         char buf[CMSG_SPACE(sizeof(int))];
         struct cmsghdr align;
@@ -29,97 +76,105 @@ static int recv_unotify_fd(int sock, uintptr_t& lo, uintptr_t& hi) {
 
     ssize_t n = recvmsg(sock, &msg, MSG_CMSG_CLOEXEC);
     if (n < 0) {
-        perror("supervisor: recvmsg");
-        return -1;
-    }
-    if (n != sizeof(range)) {
-        fprintf(stderr, "supervisor: short read: %zd\n", n);
-        return -1;
+        throw std::system_error(errno, std::system_category(), "recvmsg");
     }
 
     struct cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
-    if (!cmsg || cmsg->cmsg_level != SOL_SOCKET || cmsg->cmsg_type != SCM_RIGHTS
-        || cmsg->cmsg_len != CMSG_LEN(sizeof(int))) {
-        fprintf(stderr, "supervisor: missing or malformed SCM_RIGHTS\n");
-        return -1;
+    if (!cmsg || cmsg->cmsg_level != SOL_SOCKET ||
+        cmsg->cmsg_type != SCM_RIGHTS ||
+        cmsg->cmsg_len != CMSG_LEN(sizeof(int))) {
+        throw std::runtime_error("supervisor: invalid SCM_RIGHTS");
     }
 
     int unotify_fd;
     memcpy(&unotify_fd, CMSG_DATA(cmsg), sizeof(int));
-    lo = range.lo;
-    hi = range.hi;
     return unotify_fd;
 }
 
-// Returns true if [addr, addr+size) overlaps [lo, hi).
-// Handles wraparound: if addr+size wraps, the range covers everything above addr,
-// which necessarily overlaps any [lo, hi) where hi > lo.
 static bool overlaps(uintptr_t addr, uintptr_t size, uintptr_t lo, uintptr_t hi) {
-    // addr+size > lo  AND  addr < hi
-    // For wraparound case (addr+size < addr), the range wraps around the
-    // address space, so it definitely overlaps any non-empty [lo, hi).
     uintptr_t end = addr + size;
     bool wrapped = (end < addr);
-    return (wrapped || end > lo) && (addr < hi);
+    if (wrapped) {
+        return (addr < hi) || (end > lo);
+    }
+    return (end > lo) && (addr < hi);
 }
 
-// mprotect/mmap/munmap/madvise/remap_file_pages: args[0]=addr, args[1]=len.
-// mremap: blocked unconditionally — MREMAP_FIXED moves the mapping to a new
-// address chosen by the caller, making a safe overlap check impossible.
-static bool handle_notification(int unotify_fd, uintptr_t lo, uintptr_t hi) {
+static bool ip_is_allowed(uintptr_t ip, const Config& cfg) {
+    for (AllowedSite site : cfg.allowed) {
+        if (ip == site + 2)
+            return true;
+    }
+    return false;
+}
+
+static bool handle_notification(int unotify_fd, const Config& cfg) {
     struct seccomp_notif req = {};
     struct seccomp_notif_resp resp = {};
 
     if (ioctl(unotify_fd, SECCOMP_IOCTL_NOTIF_RECV, &req) < 0) {
-        if (errno == EINTR) return true;   // interrupted, keep going
-        if (errno == ENODEV) return false; // tracee thread exited, we're done
+        if (errno == EINTR)  return true;
+        if (errno == ENODEV) return false;
         perror("supervisor: SECCOMP_IOCTL_NOTIF_RECV");
         return false;
     }
 
     resp.id    = req.id;
     resp.flags = 0;
-    resp.error = 0;
+    resp.error = -EPERM;
 
-    // Check the notification is still valid before we act on it.
-    // This closes the race where the thread exits between RECV and SEND.
-    if (ioctl(unotify_fd, SECCOMP_IOCTL_NOTIF_ID_VALID, &req.id) < 0) {
-        // Thread is gone — keep looping in case other threads share this filter.
+    if (ioctl(unotify_fd, SECCOMP_IOCTL_NOTIF_ID_VALID, &req.id) < 0)
         return true;
-    }
 
-    // All remaining syscalls (mprotect, mmap, munmap, madvise):
-    // args[0]=addr, args[1]=len — check for overlap with protected range.
-    bool deny = overlaps(req.data.args[0], req.data.args[1], lo, hi);
+    uintptr_t ip   = req.data.instruction_pointer;
+    uintptr_t addr = req.data.args[0];
+    uintptr_t len  = req.data.args[1];
+    int       prot = (int)req.data.args[2];
 
-    if (deny) {
-        resp.error = -EPERM;
-    } else {
+    bool ip_ok     = ip_is_allowed(ip, cfg);
+    bool contained = overlaps(addr, len, cfg.sensitive_lo, cfg.sensitive_hi);
+    bool prot_safe = prot == PROT_NONE;
+
+    if (!contained) {
+        // touches other memory, this is fine
+        resp.error = 0;
         resp.flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
+    } else if ((ip_ok || prot_safe) && req.data.nr == SYS_mprotect) {
+        // touches our memory, but either makes it PROT_NONE or is from a whitelisted instruction
+        resp.error = 0;
+        resp.flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
+        dbgprint("Allowed mprotect from ip=0x%lx addr=[0x%lx,0x%lx) prot=%d\n",ip, addr, addr + len, prot);
+    } else {
+        dbgprint("supervisor: DENIED syscall %d from ip=0x%lx addr=[0x%lx,0x%lx) prot=%d "
+                 "(ip_ok=%d contained=%d)\n",
+                 req.data.nr, ip, addr, addr + len, prot, ip_ok, contained);
     }
 
-    if (ioctl(unotify_fd, SECCOMP_IOCTL_NOTIF_SEND, &resp) < 0) {
-        if (errno == ENOENT) return true; // thread gone between ID_VALID and SEND, fine
-        perror("supervisor: SECCOMP_IOCTL_NOTIF_SEND");
-    }
+    if (ioctl(unotify_fd, SECCOMP_IOCTL_NOTIF_SEND, &resp) < 0)
+        if (errno != ENOENT)
+            perror("supervisor: SECCOMP_IOCTL_NOTIF_SEND");
+
     return true;
 }
 
-// Entry point for the supervisor process.
-// sock_fd is the supervisor's end of the socketpair, passed directly from Python.
 int supervisor_main(int sock_fd) {
-    // Die if our parent (the tracee process) dies.
+    if (prctl(PR_SET_DUMPABLE, 0) < 0)
+        throw std::system_error(errno, std::system_category(), "prctl(PR_SET_DUMPABLE)");
+
     prctl(PR_SET_PDEATHSIG, SIGTERM);
 
-    uintptr_t lo, hi;
-    int unotify_fd = recv_unotify_fd(sock_fd, lo, hi);
+    Config cfg;
+    int unotify_fd = recv_setup(sock_fd, cfg);
     close(sock_fd);
 
     if (unotify_fd < 0) return 1;
 
-    // Event loop: handle notifications until the tracee thread exits,
-    // at which point the unotify fd becomes invalid and NOTIF_RECV returns ENODEV.
-    while (handle_notification(unotify_fd, lo, hi))
+    dbgprint("supervisor: sensitive=[0x%lx, 0x%lx), %zu allowed sites\n",
+            cfg.sensitive_lo, cfg.sensitive_hi, cfg.allowed.size());
+    for (AllowedSite site : cfg.allowed)
+        dbgprint("supervisor: allowed site: 0x%lx\n", site);
+
+    while (handle_notification(unotify_fd, cfg))
         ;
 
     close(unotify_fd);

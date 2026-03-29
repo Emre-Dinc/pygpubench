@@ -7,9 +7,25 @@
 #include <unistd.h>
 #include <seccomp.h>
 
+#include "protect.h"
+#include "protocol.h"
+
 static inline void check_seccomp(int rc, const char* what) {
     if (rc < 0)
         throw std::system_error(-rc, std::generic_category(), what);
+}
+
+static void send_all(int sock, const void* buf, size_t len) {
+    const auto* p = static_cast<const char*>(buf);
+    while (len > 0) {
+        ssize_t n = send(sock, p, len, MSG_NOSIGNAL);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            throw std::system_error(errno, std::system_category(), "send");
+        }
+        p   += n;
+        len -= n;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -62,12 +78,23 @@ static int install_memory_notify_filter() {
 // Send the unotify fd + range to the supervisor over the socketpair.
 // ---------------------------------------------------------------------------
 
-struct RangeMsg { uintptr_t lo, hi; };
+static void send_unotify_fd(int sock, int unotify_fd,
+                            uintptr_t sensitive_lo, uintptr_t sensitive_hi) {
+    uint32_t n = __stop___allowed_mprotect - __start___allowed_mprotect;
+    if (n > MAX_ALLOWED_SITES)
+        throw std::runtime_error("too many allowed sites");
 
-static void send_unotify_fd(int sock, int unotify_fd, uintptr_t lo, uintptr_t hi) {
-    RangeMsg range = { lo, hi };
-    struct iovec iov = { &range, sizeof(range) };
+    SupervisorSetupMsg hdr { sensitive_lo, sensitive_hi, n };
 
+    // Send header + site array as regular data
+    send_all(sock, &hdr, sizeof(hdr));
+
+    size_t sites_sz = n * sizeof(AllowedSite);
+    send_all(sock, __start___allowed_mprotect, sites_sz);
+
+    // Send unotify_fd via SCM_RIGHTS
+    char dummy = 0;
+    struct iovec iov = { &dummy, 1 };
     union {
         char buf[CMSG_SPACE(sizeof(int))];
         struct cmsghdr align;
@@ -86,8 +113,8 @@ static void send_unotify_fd(int sock, int unotify_fd, uintptr_t lo, uintptr_t hi
     cmsg->cmsg_len   = CMSG_LEN(sizeof(int));
     memcpy(CMSG_DATA(cmsg), &unotify_fd, sizeof(int));
 
-    if (sendmsg(sock, &msg, 0) < 0)
-        throw std::system_error(errno, std::system_category(), "sendmsg");
+    if (sendmsg(sock, &msg, MSG_NOSIGNAL) < 0)
+        throw std::system_error(errno, std::system_category(), "sendmsg unotify_fd");
 }
 
 // ---------------------------------------------------------------------------
